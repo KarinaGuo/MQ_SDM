@@ -1,0 +1,594 @@
+---
+title: "SDM_Biomod"
+date: "2024-08-09"
+---
+
+# General setup
+
+Configuring filepaths, loading data, etc.
+
+```{r filepath set up, eval=FALSE, include=FALSE}
+setwd("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/")
+getwd()
+load("SDM_maxent.RData")
+
+  # Prepping MaxEnt
+#utils::download.file(url = "https://raw.githubusercontent.com/mrmaxent/Maxent/master/ArchivedReleases/3.3.3k/maxent.jar", destfile = paste0(system.file("java", package = "dismo"), "/maxent.jar"), mode = "wb")  ## wb for binary file, otherwise maxent.jar can not execute
+```
+
+Set seeds so random sampling of background data is consistent :)
+
+```{r}
+set.seed(12345)
+```
+
+Reading in the libraries
+
+```{r library, include=FALSE}
+# Working with rasters
+library(terra)
+library(geodata)
+library(raster)
+library(rgeos)
+
+# Maxent
+library(predicts)
+library(dismo)
+library(rJava)
+
+# Reading in the files and processing dataset
+library(readxl) 
+library(tidyverse) 
+
+# Plots
+library(RColorBrewer)
+
+# Biomod
+library(iSDM)
+library(ade4)
+library(geometry)
+library(pdist)
+library(vegan)
+library(maptools)
+library(ncdf4)
+library(biomod2)
+library(gtools)
+library(PresenceAbsence)
+library(ecospat)
+library(tidyterra)
+```
+
+## Data preparation and cleaning
+
+Reading and cleaning data
+
+```{r message=FALSE}
+MR_locs <- read_excel("MR_locs.xlsx")
+MR_locs$species <- "Austropuccinia psidii"
+MR_locs_clean <- MR_locs[!is.na(MR_locs$decimalLatitude), ]
+cat(nrow(MR_locs) - nrow(MR_locs_clean), "'NA latitude' records are removed\n")
+
+MR_locs_AUS <- MR_locs_clean[MR_locs_clean$Country=="Australia",]
+cat("Filtered to", nrow(MR_locs_AUS), "Australian records")
+
+CoordinateCleaner_inval <- CoordinateCleaner::cc_val(x = MR_locs_AUS, lon = "decimalLongitude", lat = "decimalLatitude")
+flags <- CoordinateCleaner::clean_coordinates(x = CoordinateCleaner_inval, lon = "decimalLongitude", lat = "decimalLatitude",
+                           tests = c("duplicates", "equal","gbif", "seas", "zeros", verbose = TRUE))
+
+MR_locs_AUS_reclean <- CoordinateCleaner_inval[flags$.summary,]
+```
+
+
+Installing bioclim data 
+- 30s takes too long to render in the application
+- 2.5m for maxent
+- 10m for biomod (2.5m crashes my device :( in biomod) 
+
+```{r eval=FALSE}
+resolution="10m"
+
+utils::download.file(url = "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_",resolution,"_bio.zip", destfile = paste0("data/bioclim/wc2.1_",resolution,"_bio.zip"))
+utils::unzip(paste0("data/bioclim/wc2.1_",resolution,"_bio.zip"), exdir = paste0("data/bioclim/wc2.1_",resolution,"_bio/"))
+``` 
+Reading in bioclim data = 10m
+
+```{r}
+resolution="10m"
+clim_list <- list.files(paste0("data/bioclim/wc2.1_",resolution,"_bio/"), full.names = T)
+bioclim_data <- raster::stack(clim_list) # stacking the bioclim variables to process them at one go
+```
+
+Thinning occurrence data (keep one occurrence point per raster cell) -
+done to prevent oversampling
+
+```{r}
+cells <- cellFromXY(bioclim_data[[1]], xy=as.data.frame(MR_locs_AUS_reclean[, c("decimalLongitude", "decimalLatitude")]))
+dups <- duplicated(cells)
+MR_locs_AUS_thin <- MR_locs_AUS_reclean[!dups, ]
+cat(nrow(MR_locs_AUS_reclean) - nrow(MR_locs_AUS_thin), "records were removed during thinning")
+
+MR_locs_AUS_thin_locations <- as.data.frame(MR_locs_AUS_thin[, c("decimalLongitude", "decimalLatitude")])
+```
+
+## Randomisation of training and testing
+
+```{r}
+training_volume = floor(nrow(MR_locs_AUS_thin_locations)*.2)
+
+selected <- sample(1:nrow(MR_locs_AUS_thin_locations), nrow(MR_locs_AUS_thin_locations) * .2)
+
+MR_locs_AUS_thin_locations_test <- MR_locs_AUS_thin_locations[selected,]
+MR_locs_AUS_thin_locations_train <- MR_locs_AUS_thin_locations[-selected,]
+
+# Convert to coordinates
+coordinates(MR_locs_AUS_thin_locations) <- ~decimalLongitude + decimalLatitude
+coordinates(MR_locs_AUS_thin_locations_test) <- ~decimalLongitude + decimalLatitude
+coordinates(MR_locs_AUS_thin_locations_train) <- ~decimalLongitude + decimalLatitude
+
+# Plot to observe results
+plot_bioclim <- crop(bioclim_data[[1]], extent(130,160,-45,-10)); 
+plot(plot_bioclim) ; plot(MR_locs_AUS_thin_locations_train, add = TRUE, col = "blue", pch=16, size=0.5) ; plot(MR_locs_AUS_thin_locations_test, add = TRUE, pch=16, col = "red", size=0.5) ; legend("bottomright", legend = c("Testing", "Training"), fill = c("red", "blue"), title="Data points used")
+```
+
+Creating the study area where the model will be run
+
+```{r}
+MR_locs_AUS_thin_buffed <- buffer(MR_locs_AUS_thin_locations, 500000) # Using the whole dataset
+
+# Crop bioclim data to desired extent
+bioclim_data_rast_crop <- crop(bioclim_data, extent(MR_locs_AUS_thin_buffed))
+studyArea <- mask(bioclim_data_rast_crop, MR_locs_AUS_thin_buffed)
+
+plot(studyArea)
+```
+
+Save the new rasters of the study area as ASCII
+
+```{r eval=FALSE}
+# save the new study area rasters as ascii
+writeRaster(raster::stack(studyArea), filename=paste0("data/studyarea/",names(studyArea),".asc"), format="ascii", bylayer=TRUE, overwrite=T)
+```
+
+## Creating the model
+
+Randomly sample points for the pseudo-absences (same number as our observed points)
+
+```{r}
+background <- randomPoints(mask = (studyArea[[1]]), # Provides sampling point resolution
+                           n = (length(MR_locs_AUS_thin_locations@coords[,2])*10), # Number of random points points
+                           p = MR_locs_AUS_thin_locations,
+                           ext = extent(raster(studyArea[[1]])), # Spatially restricts sampling - do we use the full extent here or study area 
+                           extf = 1,
+                           excludep=TRUE) # Expands sampling a little bit
+
+plot(studyArea[[1]]); points(background, pch=16); points(MR_locs_AUS_thin_locations, col = "red", pch=16); legend("bottomright", legend = c("All points", "Background"), fill = c("red", "black"), title="Presence absence\n data points used")
+```
+
+Creating binary data to represent presence/absence
+
+###################################################################################################
+# Overlapping different models
+
+## Biomod - MR
+```{r}
+# Presence data
+MR_biomod_pres <- as.data.frame(MR_locs_AUS_thin[, c("decimalLongitude", "decimalLatitude")])
+MR_biomod_pres$Species <- "MR"
+MR_biomod_pres$Response <- 1
+
+# Absence data
+MR_biomod_abs <- as.data.frame(background); colnames(MR_biomod_abs) <- c("decimalLongitude", "decimalLatitude")
+MR_biomod_abs$Species <- "MR"
+MR_biomod_abs$Response <- 0
+
+# Bind
+MR_biomod_data <- rbind(MR_biomod_pres, MR_biomod_abs)
+names(MR_biomod_data)
+
+# Enviro data
+env_vars_des <- c("wc2.1_10m_bio_1", "wc2.1_10m_bio_2", "wc2.1_10m_bio_5", "wc2.1_10m_bio_6", "wc2.1_10m_bio_7", "wc2.1_10m_bio_8", "wc2.1_10m_bio_14", "wc2.1_10m_bio_18")
+env_vars_des_fp <- sapply(env_vars_des, function(x) paste0("data/bioclim/wc2.1_10m_bio/",x,".tif"))
+bioclim_data_bioclim <- raster::stack(env_vars_des_fp) # stacking the bioclim variables to process them at one go
+
+
+############## Run the models  ##############
+myBiomodData1 <- BIOMOD_FormatingData(resp.var = MR_biomod_data[, 4], # response variable
+                                      resp.xy = MR_biomod_data[,1:2], # locations
+                                      expl.var = bioclim_data_bioclim, # stacked bioclim data
+                                      resp.name = MR_biomod_data[1,3],  # species name
+                                      filter.raster = TRUE) # trim down to just one per raster cell
+
+summary(myBiomodData1)
+
+#myBiomodOptions <- Print_Default_ModelingOptions()   # load the package options
+
+```
+
+Individual models
+```{r message=FALSE}
+# Individual models 
+output_fp <- "~/Uni/Doctorate/SDM/output/biomod2/"
+myBiomodModelOut1 <- BIOMOD_Modeling(myBiomodData1,
+                                     modeling.id = paste(MR_biomod_data[1,3],"_biomod",sep="."),
+                                     models = c('GLM','RF'), # minimum two modelling algorithms 
+                                     #bm.options = myBiomodOptions,
+                                     CV.strategy = 'random',
+                                     CV.nb.rep = 50, # 50 repetitions because this is taking too long ahhh
+                                     CV.perc = 0.75,
+                                     metric.eval = c('TSS','ROC'),
+                                     var.import = 3,
+                                     do.full.models = FALSE,
+                                     seed.val = 42)
+
+model_eval <- get_evaluations(myBiomodModelOut1)
+write.table(model_eval, file=file.path(paste0(output_fp, MR_biomod_data[1,3],"_IndMod_eval.txt")), row.names = F) #model evaluation
+
+var_eval <- get_variables_importance(myBiomodModelOut1)
+write.table(var_eval, file=file.path(paste0(output_fp, MR_biomod_data[1,3],"_IndMod_varimp.txt")), row.names = F) 
+```
+
+Ensemble models
+```{r}
+# Ensemble model 
+myBiomodEM1<-BIOMOD_EnsembleModeling(myBiomodModelOut1,    # do the ensemble models thresholded by 1 or 2 metrics
+                                     models.chosen = 'all',
+                                     em.by = 'all',
+                                     em.algo = c('EMmean'),     # probability weighted mean or committee averaging
+                                     metric.select = c('TSS'),
+                                     metric.select.thresh = c(0.6), # selects only models with TSS above the threshold
+                                     metric.eval = c('TSS'),
+                                     var.import = 3,
+                                     seed.val = 42)
+
+model_eval <- get_evaluations(myBiomodEM1)
+write.table(model_eval, file=file.path(paste0(output_fp, MR_biomod_data[1,3],"_EMMod_eval.txt")), row.names = F) #model evaluation
+
+var_eval <- get_variables_importance(myBiomodEM1)
+write.table(var_eval, file=file.path(paste0(output_fp, MR_biomod_data[1,3],"_EMMod_varimp.txt")), row.names = F) 
+
+```
+
+Project!
+```{r}
+############### Do model projections  #############
+
+# Individual model projections 
+myBiomodProj1 <- BIOMOD_Projection(bm.mod = myBiomodModelOut1,     # individual projections
+                                   new.env = bioclim_data_bioclim,
+                                   proj.name = 'Current',
+                                   models.chosen = 'all',
+                                   metric.binary = 'all',
+                                   metric.filter = 'all',
+                                   build.clamping.mask = TRUE,
+                                   do.stack=T,
+                                   overwrite=TRUE)
+#plot(myBiomodProj1) # Plots all models
+
+
+# Ensemble model projection 
+myBiomodEF1 <- BIOMOD_EnsembleForecasting(myBiomodEM1,          # ensemble projections
+                                        bm.proj = myBiomodProj1,
+                                         selected.models = 'all',
+                                        proj.name = "EM_pro")
+
+## Plotting - trim to previous maxent extents
+myBiomodEF_fromtif <- raster("~/Uni/Doctorate/SDM/MR/proj_Current/proj_Current_MR.tif")
+myBiomodEF1_crop <- crop(x = myBiomodEF_fromtif, y = studyArea@extent)
+
+# Plot the base map
+# Determine geographic extent of our data
+max_lat <- ceiling(max(MR_locs_AUS_thin_locations$decimalLatitude)); min_lat <- floor(min(MR_locs_AUS_thin_locations$decimalLatitude))
+max_lon <- ceiling(max(MR_locs_AUS_thin_locations$decimalLongitude)) ; min_lon <- floor(min(MR_locs_AUS_thin_locations$decimalLongitude))
+world_map <- world(resolution = 3, path = "data/") # Download data with geodata's world function to use for our base map
+
+# Store boundaries in a single extent object
+geographic_extent <- ext(x = c(min_lon, max_lon, min_lat, max_lat))
+my_map <- crop(x = world_map, y = geographic_extent) # Crop the map to our area of interest
+
+# plotting results..
+pal_mr <- colorRampPalette(c("grey95","darkblue","red"))
+plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(myBiomodEF1_crop, add = TRUE, col = pal_mr(20)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T, main="BIOMOD - MR prediction", xlab="Latitude", ylab="Longitude")
+```
+
+## Biomod - Mquin
+
+Silly data preparation, same as maxent models
+```{r}
+# Read in data
+Mquin_locs <- read.csv("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/Mquin_ALA_records.csv")
+Mquin_locs$species <- "Melaleuca quinquenervia"
+
+Mquin_locs_clean <- Mquin_locs[!is.na(Mquin_locs$decimalLatitude), ]
+cat(nrow(Mquin_locs) - nrow(Mquin_locs_clean), "'NA latitude' records are removed")
+
+CoordinateCleaner_inval <- CoordinateCleaner::cc_val(x = Mquin_locs_clean, lon = "decimalLongitude", lat = "decimalLatitude")
+flags <- CoordinateCleaner::clean_coordinates(x = CoordinateCleaner_inval, lon = "decimalLongitude", lat = "decimalLatitude",                                  ,
+                                              tests = c("duplicates", "equal","gbif", "seas", "zeros", verbose = TRUE))
+
+# Cleaning results
+Mquin_locs_reclean <- CoordinateCleaner_inval[flags$.summary,]
+cat("Final occurrence count", nrow(Mquin_locs_reclean), "from the original", nrow(Mquin_locs))
+
+# Thin occ data (keep one occurrence point per cell)
+cells <- cellFromXY(bioclim_data[[1]], xy=as.data.frame(Mquin_locs_reclean[, c("decimalLongitude", "decimalLatitude")]))
+dups <- duplicated(cells)
+Mquin_locs_reclean_thin <- Mquin_locs_reclean[!dups, ]
+
+cat(nrow(Mquin_locs_reclean) - nrow(Mquin_locs_reclean_thin), "records are removed through thinning")
+
+Mquin_locs_reclean_locations <- as.data.frame(Mquin_locs_reclean_thin[, c("decimalLongitude", "decimalLatitude")])
+
+training_volume = floor(nrow(Mquin_locs_reclean_locations)*.2)
+
+selected <- sample(1:nrow(Mquin_locs_reclean_locations), nrow(Mquin_locs_reclean_locations) * .2)
+
+Mquin_locs_reclean_locations_test <- Mquin_locs_reclean_locations[selected,]
+Mquin_locs_reclean_locations_train <- Mquin_locs_reclean_locations[-selected,]
+
+# Convert to coordinates
+coordinates(Mquin_locs_reclean_locations) <- ~decimalLongitude + decimalLatitude
+coordinates(Mquin_locs_reclean_locations_test) <- ~decimalLongitude + decimalLatitude
+coordinates(Mquin_locs_reclean_locations_train) <- ~decimalLongitude + decimalLatitude
+
+# Plot to observe results
+plot_bioclim <- crop(bioclim_data[[1]], extent(130,160,-45,-10)); 
+plot(plot_bioclim) ; plot(Mquin_locs_reclean_locations_train, add = TRUE, col = "blue", pch=16, size=0.5) ; plot(Mquin_locs_reclean_locations_test, add = TRUE, pch=16, col = "red", size=0.5) ; legend("bottomright", legend = c("Testing", "Training"), fill = c("red", "blue"), title="Data points used")
+
+#Creating the study area where the model will be run
+
+Mquin_locs_reclean_locations_buffed <- buffer(Mquin_locs_reclean_locations, 500000) # Using the whole dataset
+
+# Crop bioclim data to desired extent
+bioclim_data_rast_crop <- crop(bioclim_data, extent(Mquin_locs_reclean_locations_buffed))
+studyArea <- mask(bioclim_data_rast_crop, MR_locs_AUS_thin_buffed) # using the same study area as MR for clarity
+
+plot(studyArea)
+
+#Save the new rasters of the study area as ASCII
+
+writeRaster(raster::stack(studyArea), filename=paste0("data/studyarea_2/",names(studyArea),".asc"), format="ascii", bylayer=TRUE, overwrite=T)
+
+#Creating the model
+#Randomly sample points for the pseudo-absences(same number as our observed points)
+
+background <- randomPoints(mask = (studyArea[[1]]), # Provides sampling point resolution
+                           n = length(Mquin_locs_reclean_locations@coords[,2]), # Number of random points points
+                           p = Mquin_locs_reclean_locations,
+                           ext = extent(raster(studyArea[[1]])), # Spatially restricts sampling - do we use the full extent here or study area 
+                           extf = 1,
+                           excludep=TRUE) # Expands sampling a little bit
+
+plot(studyArea[[1]]); points(background, pch=16); points(Mquin_locs_reclean_locations, col = "red", pch=16); legend("bottomright", legend = c("All points", "Background"), fill = c("red", "black"), title="Presence absence\n data points used")
+```
+
+```{r}
+# Presence data
+Mquin_biomod_pres <- as.data.frame(Mquin_locs_reclean[, c("decimalLongitude", "decimalLatitude")])
+Mquin_biomod_pres$Species <- "MelQuin"
+Mquin_biomod_pres$Response <- 1
+
+# Absence data
+Mquin_biomod_abs <- as.data.frame(background); colnames(Mquin_biomod_abs) <- c("decimalLongitude", "decimalLatitude")
+Mquin_biomod_abs$Species <- "MelQuin"
+Mquin_biomod_abs$Response <- 0
+
+# Bind
+Mquin_biomod_data <- rbind(Mquin_biomod_pres, Mquin_biomod_abs)
+names(Mquin_biomod_data)
+
+# Enviro data
+env_vars_des <- c("wc2.1_10m_bio_12", "wc2.1_10m_bio_10", "wc2.1_10m_bio_15", "wc2.1_10m_bio_16", "wc2.1_10m_bio_4", "wc2.1_10m_bio_5", "wc2.1_10m_bio_14")
+env_vars_des_fp <- sapply(env_vars_des, function(x) paste0("data/bioclim/wc2.1_10m_bio/",x,".tif"))
+bioclim_data_MQ <- raster::stack(env_vars_des_fp) # stacking the bioclim variables to process them at one go
+```
+
+Running data format for biomod
+```{r}
+############## Run the models  ##############
+myBiomodData1_MQ <- BIOMOD_FormatingData(resp.var = Mquin_biomod_data[, 4], # response variable
+                                      resp.xy = Mquin_biomod_data[,1:2], # locations
+                                      expl.var = bioclim_data_MQ, # stacked bioclim data
+                                      resp.name = Mquin_biomod_data[1,3],  # species name
+                                      filter.raster = TRUE) # trim down to just one per cell
+
+summary(myBiomodData1)
+
+#myBiomodOptions <- Print_Default_ModelingOptions()   # load the package options
+```
+
+Individual models 
+```{r message = FALSE}
+output_fp <- "~/Uni/Doctorate/SDM/output/biomod2/"
+myBiomodModelOut1_MQ <- BIOMOD_Modeling(myBiomodData1_MQ,
+                                     modeling.id = paste(Mquin_biomod_data[1,3],"_biomod",sep="."),
+                                     models = c('GLM','RF'), # minimum two modelling algorithms 
+                                     #bm.options = myBiomodOptions,
+                                     CV.strategy = 'random',
+                                     CV.nb.rep = 50, 
+                                     CV.perc = 0.75,
+                                     metric.eval = c('TSS','ROC'),
+                                     var.import = 3,
+                                     do.full.models = FALSE,
+                                     seed.val = 42)
+
+model_eval <- get_evaluations(myBiomodModelOut1_MQ)
+write.table(model_eval, file=file.path(paste0(output_fp, Mquin_biomod_data[1,3],"_IndMod_eval.txt")), row.names = F) #model evaluation
+
+var_eval <- get_variables_importance(myBiomodModelOut1_MQ)
+write.table(var_eval, file=file.path(paste0(output_fp, Mquin_biomod_data[1,3],"_IndMod_varimp.txt")), row.names = F) 
+```
+
+Ensemble model 
+```{r}
+myBiomodEM1_MQ<-BIOMOD_EnsembleModeling(myBiomodModelOut1_MQ,    # do the ensemble models thresholded by 1 or 2 metrics
+                                     models.chosen = 'all',
+                                     em.by = 'all',
+                                     em.algo = c('EMmean'),     # probability weighted mean or committee averaging
+                                     metric.select = c('TSS'),
+                                     metric.select.thresh = c(0.6), # selects only models with TSS above the threshold
+                                     metric.eval = c('TSS'),
+                                     var.import = 3,
+                                     seed.val = 42)
+
+model_eval <- get_evaluations(myBiomodEM1_MQ)
+write.table(model_eval, file=file.path(paste0(output_fp, Mquin_biomod_data[1,3],"_EMMod_eval.txt")), row.names = F) #model evaluation
+
+var_eval <- get_variables_importance(myBiomodEM1_MQ)
+write.table(var_eval, file=file.path(paste0(output_fp, Mquin_biomod_data[1,3],"_EMMod_varimp.txt")), row.names = F) 
+
+```
+
+Projections!
+```{r}
+# Individual model projections 
+myBiomodProj1_MQ <- BIOMOD_Projection(bm.mod = myBiomodModelOut1_MQ,     # individual projections
+                                   new.env = bioclim_data_MQ,
+                                   proj.name = 'Current',
+                                   models.chosen = 'all',
+                                   metric.binary = 'all',
+                                   metric.filter = 'all',
+                                   build.clamping.mask = TRUE,
+                                   do.stack=TRUE,
+                                   overwrite=TRUE)
+#plot(myBiomodProj1) # Plots all models
+
+# Ensemble model projection 
+myBiomodEF1_MQ <- BIOMOD_EnsembleForecasting(myBiomodEM1_MQ,          # ensemble projections
+                                        bm.proj = myBiomodProj1_MQ,
+                                         selected.models = 'all',
+                                        proj.name = "EM_pro")
+
+## Plotting - trim to previous maxent extents
+myBiomodEF_fromtif_MQ <- raster("~/Uni/Doctorate/SDM/MelQuin/proj_Current/proj_Current_MelQuin.tif")
+myBiomodEF1_crop_MQ <- crop(x = myBiomodEF_fromtif_MQ, y = studyArea@extent)
+
+# Plot the base map
+# Determine geographic extent of our data
+max_lat <- ceiling(max(Mquin_locs_reclean$decimalLatitude)); min_lat <- floor(min(Mquin_locs_reclean$decimalLatitude))
+max_lon <- ceiling(max(Mquin_locs_reclean$decimalLongitude)) ; min_lon <- floor(min(Mquin_locs_reclean$decimalLongitude))
+world_map <- world(resolution = 3, path = "data/") # Download data with geodata's world function to use for our base map
+
+# Store boundaries in a single extent object
+geographic_extent <- ext(x = c(min_lon, max_lon, min_lat, max_lat))
+my_map <- crop(x = world_map, y = geographic_extent) # Crop the map to our area of interest
+
+# plotting results..
+pal_mq <- colorRampPalette(c("grey95","orange","forestgreen"))
+plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(myBiomodEF1_crop_MQ, add = TRUE, col = pal_mq(20)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T, main="BIOMOD - MQ prediction", xlab="Latitude", ylab="Longitude")
+```
+
+# Getting the overlay between the two
+1. Reduce to the same extent
+```{r}
+extent_intersection <- terra::intersect(extent(myBiomodEF1_crop), extent(myBiomodEF1_crop_MQ))
+
+my_map <- crop(x = world_map, y = extent_intersection) # Crop the map to our area of interest
+myBiomodEF1_crop <- raster::crop(x = myBiomodEF1_crop, extent_intersection) # Crop the map to our area of interest
+myBiomodEF1_MQ_crop <- raster::crop(x = myBiomodEF1_crop_MQ, extent_intersection) # Crop the map to our area of interest
+```
+
+2. Calculate overlay
+```{r}
+rsum_BM = sum(myBiomodEF1_crop,myBiomodEF1_MQ_crop,na.rm=TRUE)
+```
+
+
+# Compare ensemble map and maxent map
+```{r Method comparisons}
+par(mfrow = c(3,2))
+world_map <- world(resolution = 3, path = "data/") # Download data with geodata's world function to use for our base map
+my_map <- crop(x = world_map, y = extent_intersection) # Crop the map to our area of interest
+## MAXENT - Plotted MR
+pal_mr <- colorRampPalette(c("grey95","darkblue","red"))
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(ped1, add = TRUE, col = pal_mr(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="MAXENT - MR prediction", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+
+## Biomod - Plotted MR
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(myBiomodEF1_crop, add = TRUE, col = pal_mr(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="Biomod - MR prediction", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+
+## MAXENT - Plotted Mquin
+pal_mq <- colorRampPalette(c("grey95","orange","forestgreen"))
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(ped_mquin, add = TRUE, col = pal_mq(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="MAXENT - MelQuin prediction", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+
+## Biomod - Plotted MR
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(myBiomodEF1_crop_MQ, add = TRUE, col = pal_mq(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="Biomod - MelQuin prediction", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+
+## MAXENT - Plotted int
+pal_int <- colorRampPalette(c("white","yellow","red", "brown"))
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(rsum, add = TRUE, col = pal_int(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="MAXENT - Pred. intersection", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+
+## Biomod - Plotted int
+plot(my_map, axes = TRUE, col = "grey95", border="white", xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(rsum_BM, add = TRUE, col = pal_int(20), xlim=c(137,158.7), ylim = c(-42.8,-5.7)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="Biomod - Pred. intersection", xlab="Latitude", ylab="Longitude", xlim=c(137,158.7), ylim = c(-42.8,-5.7))
+```
+
+# Future predictions
+
+Downloading the future distribution for 2021-2040 for test 1
+
+```{r eval=FALSE}
+future_clim <- cmip6_world(model = "MPI-ESM1-2-HR", ssp = "245", time = "2021-2040", var = "bioc", res = 2.5, path = "data/bioclim")
+```
+Rename the future climate data to that used in the bioclim training data.
+
+```{r}
+future_clim <- rast('data/bioclim/wc2.1_2.5m/wc2.1_2.5m_bioc_MPI-ESM1-2-HR_ssp245_2021-2040.tif')
+
+names(future_clim) <- list('wc2.1_2.5m_bio_1','wc2.1_2.5m_bio_2','wc2.1_2.5m_bio_3','wc2.1_2.5m_bio_4','wc2.1_2.5m_bio_5', 'wc2.1_2.5m_bio_6','wc2.1_2.5m_bio_7','wc2.1_2.5m_bio_8','wc2.1_2.5m_bio_9','wc2.1_2.5m_bio_10', 'wc2.1_2.5m_bio_11','wc2.1_2.5m_bio_12','wc2.1_2.5m_bio_13','wc2.1_2.5m_bio_14','wc2.1_2.5m_bio_15', 'wc2.1_2.5m_bio_16','wc2.1_2.5m_bio_17','wc2.1_2.5m_bio_18','wc2.1_2.5m_bio_19')
+```
+
+## Future predictions with Biomod
+Pred first
+```{r}
+### a) MR first
+# Pred
+future_presence_MR_Biomod <- BIOMOD_Projection(bm.mod = myBiomodModelOut1,
+                                               new.env = future_data_rast_crop,
+                                               proj.name = 'Future',
+                                               selected.models = 'all',
+                                               binary.meth = 'TSS',
+                                               compress = FALSE,
+                                               build.clamping.mask = TRUE)
+
+future_presence_MR_Biomod_ens <- BIOMOD_EnsembleForecasting(myBiomodEM1,
+                                                            bm.proj = future_presence_MR_Biomod,
+                                                            proj.name = 'Future_ens',
+                                                            selected.models = 'all')
+
+
+### b) MQ next
+future_presence_MQ_Biomod <- BIOMOD_Projection(bm.mod = myBiomodModelOut1_MQ,
+                                               new.env = future_data_rast_crop,
+                                               proj.name = 'Future',
+                                               selected.models = 'all',
+                                               binary.meth = 'TSS',
+                                               compress = FALSE,
+                                               build.clamping.mask = TRUE)
+
+future_presence_MQ_Biomod_ens <- BIOMOD_EnsembleForecasting(myBiomodEM1_MQ,
+                                                            bm.proj = future_presence_MR_Biomod,
+                                                            proj.name = 'Future_ens',
+                                                            selected.models = 'all')
+
+```
+
+Plot Biomod future projections
+
+```{r}
+# a) MR first - Plot
+myBiomodEF_fromtif_MR_future <- raster("~/Uni/Doctorate/SDM/MR/proj_Future_ens/proj_Future_ens_MR_ensemble.tif")
+myBiomodEF_fromtif_MR_future_crop <- crop(x = myBiomodEF_fromtif_MR_future, y = studyArea@extent)
+
+MQ_ped_plot_future_Biomod <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(rast(myBiomodEF_fromtif_MR_future_crop), add = TRUE, col = pal_mr(20), range=c(0,1000)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T, main= "Future MR Biomod", xlab="Latitude", ylab="Longitude")
+
+MR_ped_plot_Biomod <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(myBiomodEF1_crop, add = TRUE, col = pal_mr(20)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="Current MR Biomod", xlab="Latitude", ylab="Longitude")
+
+
+# b) MQ next - Plot
+myBiomodEF_fromtif_MelQuin_future <- raster("~/Uni/Doctorate/SDM/MelQuin/proj_Future_ens/proj_Future_ens_MelQuin_ensemble.tif")
+myBiomodEF_fromtif_MelQuin_future_crop <- crop(x = myBiomodEF_fromtif_MelQuin_future, y = studyArea@extent)
+
+MQ_ped_plot_future_Biomod <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(rast(myBiomodEF_fromtif_MelQuin_future_crop), add = TRUE, col = pal_mq(20), range=c(0,1000)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T, main= "Future MQ Biomod", xlab="Latitude", ylab="Longitude")
+
+MQ_ped_plot_Biomod <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(myBiomodEF1_crop, add = TRUE, col = pal_mq(20)); plot(my_map, axes = FALSE, alpha=0, col=NA, add=T, main="Current MQ Biomod", xlab="Latitude", ylab="Longitude")
+
+
+```
