@@ -1,0 +1,12 @@
+name: MR_MQ_SDM
+title: MR_MQ_SDM
+username: karinag
+account: karinag
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 12701891
+bundleId:
+url: https://karinag.shinyapps.io/MR_MQ_SDM/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
