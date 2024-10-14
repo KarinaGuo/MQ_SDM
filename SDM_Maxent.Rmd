@@ -1,0 +1,640 @@
+---
+title: "SDM_Maxent"
+date: "2024-08-09"
+---
+
+# General setup
+
+Configuring filepaths
+
+```{r filepath set up, eval=FALSE, include=FALSE}
+setwd("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/")
+getwd()
+#load("SDM_maxent.RData")
+
+  # Prepping MaxEnt
+#utils::download.file(url = "https://raw.githubusercontent.com/mrmaxent/Maxent/master/ArchivedReleases/3.3.3k/maxent.jar", destfile = paste0(system.file("java", package = "dismo"), "/maxent.jar"), mode = "wb")  ## wb for binary file, otherwise maxent.jar can not execute
+```
+
+Set seeds so random sampling of background data is consistent :)
+
+```{r}
+set.seed(12345)
+```
+
+Reading in the libraries
+
+```{r library, include=FALSE}
+# Working with rasters
+library(terra)
+library(geodata)
+library(raster)
+library(rgeos)
+
+# Maxent
+library(predicts)
+library(dismo)
+library(rJava)
+
+# Reading in the files and processing dataset
+library(readxl) 
+library(tidyverse) 
+
+# Plots
+library(RColorBrewer)
+
+# Biomod
+library(iSDM)
+library(ade4)
+library(geometry)
+library(pdist)
+library(vegan)
+library(maptools)
+library(ncdf4)
+library(biomod2)
+library(gtools)
+library(PresenceAbsence)
+library(ecospat)
+library(tidyterra)
+```
+
+## Data preparation and cleaning
+
+Reading and cleaning data
+
+```{r message=FALSE}
+MR_locs <- read_excel("MR_locs.xlsx")
+MR_locs$species <- "Austropuccinia psidii"
+MR_locs_clean <- MR_locs[!is.na(MR_locs$decimalLatitude), ]
+cat(nrow(MR_locs) - nrow(MR_locs_clean), "'NA latitude' records are removed\n")
+
+MR_locs_AUS <- MR_locs_clean[MR_locs_clean$Country=="Australia",]
+cat("Filtered to", nrow(MR_locs_AUS), "Australian records")
+
+CoordinateCleaner_inval <- CoordinateCleaner::cc_val(x = MR_locs_AUS, lon = "decimalLongitude", lat = "decimalLatitude")
+flags <- CoordinateCleaner::clean_coordinates(x = CoordinateCleaner_inval, lon = "decimalLongitude", lat = "decimalLatitude",
+                           tests = c("duplicates", "equal","gbif", "seas", "zeros", verbose = TRUE))
+
+MR_locs_AUS_reclean <- CoordinateCleaner_inval[flags$.summary,]
+```
+
+
+Installing bioclim data 
+- 30s takes too long to render in the application
+- 2.5m for maxent
+- 10m for biomod (2.5m crashes my device :( in biomod) 
+
+```{r eval=FALSE}
+resolution="2.5m"
+
+utils::download.file(url = "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_",resolution,"_bio.zip", destfile = paste0("data/bioclim/wc2.1_",resolution,"_bio.zip"))
+utils::unzip(paste0("data/bioclim/wc2.1_",resolution,"_bio.zip"), exdir = paste0("data/bioclim/wc2.1_",resolution,"_bio/"))
+``` 
+Reading in bioclim data = 2.5m
+
+```{r}
+resolution="2.5m"
+clim_list <- list.files(paste0("data/bioclim/wc2.1_",resolution,"_bio/"), full.names = T)
+bioclim_data <- raster::stack(clim_list) # stacking the bioclim variables to process them at one go
+```
+
+Thinning occurrence data (keep one occurrence point per raster cell) -
+done to prevent oversampling
+
+```{r}
+cells <- cellFromXY(bioclim_data[[1]], xy=as.data.frame(MR_locs_AUS_reclean[, c("decimalLongitude", "decimalLatitude")]))
+dups <- duplicated(cells)
+MR_locs_AUS_thin <- MR_locs_AUS_reclean[!dups, ]
+cat(nrow(MR_locs_AUS_reclean) - nrow(MR_locs_AUS_thin), "records were removed during thinning")
+
+MR_locs_AUS_thin_locations <- as.data.frame(MR_locs_AUS_thin[, c("decimalLongitude", "decimalLatitude")])
+```
+
+## Randomisation of training and testing
+
+```{r}
+training_volume = floor(nrow(MR_locs_AUS_thin_locations)*.2)
+
+selected <- sample(1:nrow(MR_locs_AUS_thin_locations), nrow(MR_locs_AUS_thin_locations) * .2)
+
+MR_locs_AUS_thin_locations_test <- MR_locs_AUS_thin_locations[selected,]
+MR_locs_AUS_thin_locations_train <- MR_locs_AUS_thin_locations[-selected,]
+
+# Convert to coordinates
+coordinates(MR_locs_AUS_thin_locations) <- ~decimalLongitude + decimalLatitude
+coordinates(MR_locs_AUS_thin_locations_test) <- ~decimalLongitude + decimalLatitude
+coordinates(MR_locs_AUS_thin_locations_train) <- ~decimalLongitude + decimalLatitude
+
+# Plot to observe results
+plot_bioclim <- crop(bioclim_data[[1]], extent(130,160,-45,-10)); 
+plot(plot_bioclim) ; plot(MR_locs_AUS_thin_locations_train, add = TRUE, col = "blue", pch=16, size=0.5) ; plot(MR_locs_AUS_thin_locations_test, add = TRUE, pch=16, col = "red", size=0.5) ; legend("bottomright", legend = c("Testing", "Training"), fill = c("red", "blue"), title="Data points used")
+```
+
+Creating the study area where the model will be run
+
+```{r}
+MR_locs_AUS_thin_buffed <- buffer(MR_locs_AUS_thin_locations, 500000) # Using the whole dataset
+
+# Crop bioclim data to desired extent
+bioclim_data_rast_crop <- crop(bioclim_data, extent(MR_locs_AUS_thin_buffed))
+studyArea <- mask(bioclim_data_rast_crop, MR_locs_AUS_thin_buffed)
+
+plot(studyArea)
+```
+
+Save the new rasters of the study area as ASCII
+
+```{r eval=FALSE}
+# save the new study area rasters as ascii
+writeRaster(raster::stack(studyArea), filename=paste0("data/studyarea/",names(studyArea),".asc"), format="ascii", bylayer=TRUE, overwrite=T)
+```
+
+## Creating the model
+
+Randomly sample points for the pseudo-absences (same number as our observed points)
+
+```{r}
+background <- randomPoints(mask = (studyArea[[1]]), # Provides sampling point resolution
+                           n = (length(MR_locs_AUS_thin_locations@coords[,2])*10), # Number of random points points
+                           p = MR_locs_AUS_thin_locations,
+                           ext = extent(raster(studyArea[[1]])), # Spatially restricts sampling - do we use the full extent here or study area 
+                           extf = 1,
+                           excludep=TRUE) # Expands sampling a little bit
+
+plot(studyArea[[1]]); points(background, pch=16); points(MR_locs_AUS_thin_locations, col = "red", pch=16); legend("bottomright", legend = c("All points", "Background"), fill = c("red", "black"), title="Presence absence\n data points used")
+```
+
+Extracting environmental conditions of the training data and the
+pseudo-absence data
+
+```{r}
+presence <- raster::extract(bioclim_data, MR_locs_AUS_thin_locations_train) #tidyr overrides the extract function
+presence_test <- raster::extract(bioclim_data, MR_locs_AUS_thin_locations_test) #tidyr overrides the extract function
+absence <- raster::extract(bioclim_data, background)
+```
+
+Creating binary data to represent presence/absence
+
+```{r}
+pa <- c(rep(1, nrow(presence)), rep(0, nrow(absence)))
+pder <- as.data.frame(rbind(presence, absence))
+```
+
+## Running MaxENT models
+
+#### Iteration 1: Training MaxEnt using all values
+
+```{r}
+mod <- maxent(x=pder, # environmental conditions
+              p=pa,   # 1:presence or 0:absence
+              path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+              args=c("responsecurves"))
+
+# View the output in html to get a good visualisation for diagnostics
+#mod
+```
+
+#### Iteration 2: Training MaxEnt with specified variables
+
+Variables selected from [Elith et al.
+2012](https://doi.org/10.1007/s13313-012-0178-7). Variables reduced to:
+
+-   Bio_1: Annual Mean Temperature
+-   Bio_2: Mean Diurnal Range (Mean of monthly (max temp - min temp))
+-   Bio_5: Max Temperature of Warmest Month
+-   Bio_6: Min Temperature of Coldest Month
+-   Bio_7: Temperature Annual Range (BIO5-BIO6)
+-   Bio_8: Mean Temperature of Wettest Quarter
+-   Bio_9: Mean Temperature of Driest Quarter
+-   Bio_13: Precipitation of Wettest Month
+-   Bio_14: Precipitation of Driest Month
+-   Bio_18: Precipitation of Warmest Quarter
+
+```{r}
+
+mod2 <- maxent(x=pder[,c("wc2.1_2.5m_bio_1", "wc2.1_2.5m_bio_2", "wc2.1_2.5m_bio_5", "wc2.1_2.5m_bio_6", "wc2.1_2.5m_bio_7", "wc2.1_2.5m_bio_8", "wc2.1_2.5m_bio_9", "wc2.1_2.5m_bio_13", "wc2.1_2.5m_bio_14", "wc2.1_2.5m_bio_18")],
+                           p=pa,
+                           path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+                           args=c("responsecurves"))
+#mod2
+```
+
+#### Iteration 3: Training MaxEnt with specified variables
+
+Variables refined from diagnostic plots, and in-field observations.
+Variables reduced to:
+
+-   Bio_1: Annual Mean Temperature
+
+-   Bio_2: Mean Diurnal Range (Mean of monthly (max temp - min temp))
+
+-   Bio_5: Max Temperature of Warmest Month
+
+-   Bio_7: Temperature Annual Range (BIO5-BIO6)
+
+-   Bio_8: Mean Temperature of Wettest Quarter
+
+-   Bio_14: Precipitation of Driest Month
+
+```{r}
+mod3 <- maxent(x=pder[,c("wc2.1_2.5m_bio_1", "wc2.1_2.5m_bio_2", "wc2.1_2.5m_bio_5", "wc2.1_2.5m_bio_6", "wc2.1_2.5m_bio_7", "wc2.1_2.5m_bio_8", "wc2.1_2.5m_bio_14", "wc2.1_2.5m_bio_18")],
+               p=pa,
+               path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+               args=c("responsecurves"))
+#mod3
+```
+
+#### Model evaluation
+
+```{r}
+mod_eval_train <- dismo::evaluate(p = presence_test, a = absence, model = mod3)
+print(mod_eval_train)
+```
+
+## Happy with this model?
+
+#### 1. Bootstrap it to confirm robustness of results
+
+```{r}
+set.seed(NULL) # to allow randomness in sampling
+
+bootstrap_maxent_testpoints <- function (test_vol){
+  selected <- sample(1:length(MR_locs_AUS_thin_locations), length(MR_locs_AUS_thin_locations) * as.numeric(test_vol))
+  
+  MR_locs_AUS_thin_locations_test <- MR_locs_AUS_thin_locations[selected,]
+  MR_locs_AUS_thin_locations_train <- MR_locs_AUS_thin_locations[-selected,]
+  
+  # Convert to coordinates
+  try({coordinates(MR_locs_AUS_thin_locations) <- ~decimalLongitude + decimalLatitude},  silent = TRUE)
+  try({coordinates(MR_locs_AUS_thin_locations_test) <- ~decimalLongitude + decimalLatitude},  silent = TRUE)
+  try({coordinates(MR_locs_AUS_thin_locations_train) <- ~decimalLongitude + decimalLatitude},  silent = TRUE)
+  
+  presence <- raster::extract(bioclim_data, MR_locs_AUS_thin_locations_train) #tidyr overrides the extract function
+  presence_test <- raster::extract(bioclim_data, MR_locs_AUS_thin_locations_test) #tidyr overrides the extract function
+  absence <- raster::extract(bioclim_data, background)
+  
+  pa <- c(rep(1, nrow(presence)), rep(0, nrow(absence)))
+  pder <- as.data.frame(rbind(presence, absence))
+  
+  mod3 <- maxent(x=pder[,c("wc2.1_2.5m_bio_1", "wc2.1_2.5m_bio_2", "wc2.1_2.5m_bio_5", "wc2.1_2.5m_bio_6", "wc2.1_2.5m_bio_7", "wc2.1_2.5m_bio_8", "wc2.1_2.5m_bio_14", "wc2.1_2.5m_bio_18")],
+                 p=pa,
+                 path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+                 args=c("responsecurves"))
+  
+  mod_eval_train <- dismo::evaluate(p = presence_test, a = absence, model = mod3)
+  plot(mod_eval_train, 'ROC')
+}
+```
+
+Bootstrap 10 times at 20% testing
+
+```{r include=FALSE}
+test_vol = .2
+bootstrap_length = 10
+
+# Getting all the plots together
+pdf("bootstrap_AUC.pdf")
+par(mar = rep(2, 4), mfrow = c(bootstrap_length,1), mfcol = c(1,2))
+replicate(bootstrap_length, bootstrap_maxent_testpoints(test_vol))
+dev.off()
+```
+
+#### 2. Predictions of occurrence probability using the model
+
+##### a) project to study area [raster]
+
+```{r}
+ped1 <- predict(mod3, studyArea)  # studyArea is the clipped rasters 
+
+# Plot the base map
+# Determine geographic extent of our data
+max_lat <- ceiling(max(MR_locs_AUS_thin_locations$decimalLatitude)); min_lat <- floor(min(MR_locs_AUS_thin_locations$decimalLatitude))
+max_lon <- ceiling(max(MR_locs_AUS_thin_locations$decimalLongitude)) ; min_lon <- floor(min(MR_locs_AUS_thin_locations$decimalLongitude))
+world_map <- world(resolution = 3, path = "data/") # Download data with geodata's world function to use for our base map
+
+# Store boundaries in a single extent object
+geographic_extent <- ext(x = c(min_lon, max_lon, min_lat, max_lat))
+my_map <- crop(x = world_map, y = geographic_extent) # Crop the map to our area of interest
+
+# plotting results..
+plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(ped1, add = TRUE); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T); points(MR_locs_AUS_thin_locations, cex=0.5, pch=16, col = "olivedrab"); legend("bottomright", legend = c("All points"), fill = c("olivedrab"))
+```
+
+##### b) Project with training occurrences, what is the probability of those?
+
+```{r}
+ped2 <- predict(mod3, presence)
+boxplot(ped2)
+```
+
+# Repeating with Melaleuca quinquenervia
+
+As the process is near identical this will just be one big code chunk,
+with the exception of the final plots
+
+```{r}
+# Read in data
+Mquin_locs <- read.csv("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/Mquin_ALA_records.csv")
+Mquin_locs$species <- "Melaleuca quinquenervia"
+
+Mquin_locs_clean <- Mquin_locs[!is.na(Mquin_locs$decimalLatitude), ]
+cat(nrow(Mquin_locs) - nrow(Mquin_locs_clean), "'NA latitude' records are removed")
+
+CoordinateCleaner_inval <- CoordinateCleaner::cc_val(x = Mquin_locs_clean, lon = "decimalLongitude", lat = "decimalLatitude")
+flags <- CoordinateCleaner::clean_coordinates(x = CoordinateCleaner_inval, lon = "decimalLongitude", lat = "decimalLatitude",                                  ,
+                                              tests = c("duplicates", "equal","gbif", "seas", "zeros", verbose = TRUE))
+
+# Cleaning results
+Mquin_locs_reclean <- CoordinateCleaner_inval[flags$.summary,]
+cat("Final occurrence count", nrow(Mquin_locs_reclean), "from the original", nrow(Mquin_locs))
+
+# Thin occ data (keep one occurrence point per cell)
+cells <- cellFromXY(bioclim_data[[1]], xy=as.data.frame(Mquin_locs_reclean[, c("decimalLongitude", "decimalLatitude")]))
+dups <- duplicated(cells)
+Mquin_locs_reclean_thin <- Mquin_locs_reclean[!dups, ]
+
+cat(nrow(Mquin_locs_reclean) - nrow(Mquin_locs_reclean_thin), "records are removed through thinning")
+
+Mquin_locs_reclean_locations <- as.data.frame(Mquin_locs_reclean_thin[, c("decimalLongitude", "decimalLatitude")])
+
+training_volume = floor(nrow(Mquin_locs_reclean_locations)*.2)
+
+selected <- sample(1:nrow(Mquin_locs_reclean_locations), nrow(Mquin_locs_reclean_locations) * .2)
+
+Mquin_locs_reclean_locations_test <- Mquin_locs_reclean_locations[selected,]
+Mquin_locs_reclean_locations_train <- Mquin_locs_reclean_locations[-selected,]
+
+# Convert to coordinates
+coordinates(Mquin_locs_reclean_locations) <- ~decimalLongitude + decimalLatitude
+coordinates(Mquin_locs_reclean_locations_test) <- ~decimalLongitude + decimalLatitude
+coordinates(Mquin_locs_reclean_locations_train) <- ~decimalLongitude + decimalLatitude
+
+# Plot to observe results
+plot_bioclim <- crop(bioclim_data[[1]], extent(130,160,-45,-10)); 
+plot(plot_bioclim) ; plot(Mquin_locs_reclean_locations_train, add = TRUE, col = "blue", pch=16, size=0.5) ; plot(Mquin_locs_reclean_locations_test, add = TRUE, pch=16, col = "red", size=0.5) ; legend("bottomright", legend = c("Testing", "Training"), fill = c("red", "blue"), title="Data points used")
+
+#Creating the study area where the model will be run
+
+Mquin_locs_reclean_locations_buffed <- buffer(Mquin_locs_reclean_locations, 500000) # Using the whole dataset
+
+# Crop bioclim data to desired extent
+bioclim_data_rast_crop <- crop(bioclim_data, extent(Mquin_locs_reclean_locations_buffed))
+studyArea <- mask(bioclim_data_rast_crop, MR_locs_AUS_thin_buffed) # using the same study area as MR for clarity
+
+plot(studyArea)
+
+#Save the new rasters of the study area as ASCII
+
+writeRaster(raster::stack(studyArea), filename=paste0("data/studyarea_2/",names(studyArea),".asc"), format="ascii", bylayer=TRUE, overwrite=T)
+
+#Creating the model
+#Randomly sample points for the pseudo-absences(same number as our observed points)
+
+background <- randomPoints(mask = (studyArea[[1]]), # Provides sampling point resolution
+                           n = length(Mquin_locs_reclean_locations@coords[,2]), # Number of random points points
+                           p = Mquin_locs_reclean_locations,
+                           ext = extent(raster(studyArea[[1]])), # Spatially restricts sampling - do we use the full extent here or study area 
+                           extf = 1,
+                           excludep=TRUE) # Expands sampling a little bit
+
+plot(studyArea[[1]]); points(background, pch=16); points(Mquin_locs_reclean_locations, col = "red", pch=16); legend("bottomright", legend = c("All points", "Background"), fill = c("red", "black"), title="Presence absence\n data points used")
+
+#Extracting environmental conditions of the training data and the pseudo-absence data
+
+presence <- raster::extract(bioclim_data, Mquin_locs_reclean_locations_train) #tidyr overrides the extract function
+presence_test <- raster::extract(bioclim_data, Mquin_locs_reclean_locations_test) #tidyr overrides the extract function
+absence <- raster::extract(bioclim_data, background)
+
+#Creating binary data to represent presence/absence
+
+pa <- c(rep(1, nrow(presence)), rep(0, nrow(absence)))
+pder <- as.data.frame(rbind(presence, absence))
+
+#Running MaxEnt models
+## Similar iteration but using climate used from [Watt et al. 2009](https://doi.org/10.1111/j.1365-3180.2009.00704.x)
+
+mod_mquin <- maxent(x=pder, # environmental conditions
+              p=pa,   # 1:presence or 0:absence
+              path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+              args=c("responsecurves"))
+
+# View the output in html to get a good visualisation for diagnostics
+mod_mquin_2 <- maxent(x=pder[,c("wc2.1_2.5m_bio_12", "wc2.1_2.5m_bio_10", "wc2.1_2.5m_bio_15", "wc2.1_2.5m_bio_16", "wc2.1_2.5m_bio_4", "wc2.1_2.5m_bio_5", "wc2.1_2.5m_bio_14")],
+               p=pa,
+               path="C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs", ## folder for output
+               args=c("responsecurves"))
+mod_mquin_2
+
+
+#Model evaluation
+
+mod_eval_train <- dismo::evaluate(p = presence_test, a = absence, model = mod_mquin_2)
+print(mod_eval_train)
+
+#2. Predictions of occurrence probability using the model
+#a) project to study area [raster]
+
+ped_mquin <- predict(mod_mquin_2, studyArea)  # studyArea is the clipped rasters 
+
+# Plot the base map
+# Determine geographic extent of our data
+max_lat <- ceiling(max(Mquin_locs_reclean_thin$decimalLatitude)); min_lat <- floor(min(Mquin_locs_reclean_thin$decimalLatitude))
+max_lon <- ceiling(max(Mquin_locs_reclean_thin$decimalLongitude)) ; min_lon <- floor(min(Mquin_locs_reclean_thin$decimalLongitude))
+world_map <- world(resolution = 3, path = "data/") # Download data with geodata's world function to use for our base map
+
+# Store boundaries in a single extent object
+geographic_extent <- ext(x = c(min_lon, max_lon, min_lat, max_lat))
+my_map <- crop(x = world_map, y = geographic_extent) # Crop the map to our area of interest
+```
+
+### Plotting distribution
+```{r}
+library(ozmaps); oz_states <- ozmaps::ozmap_states
+occ_plot <- ggplot(oz_states) +
+  geom_sf(alpha = 0) +
+  geom_point(data = MR_locs_AUS_reclean, aes (decimalLongitude, decimalLatitude), alpha = 0.3, colour = "chocolate") +
+  #geom_point(data = data.frame(Mquin_locs_reclean_locations), aes (decimalLongitude, decimalLatitude), alpha = 0.3, colour = "forestgreen") +
+  ylim(c(-45,-10)) + xlim(c(130,160)) +
+  theme_minimal() + theme(
+    panel.background = element_rect(fill='white'), #transparent panel bg
+    plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+    panel.grid.major = element_blank(), #remove major gridlines
+    panel.grid.minor = element_blank(), #remove minor gridlines
+    legend.background = element_rect(fill='transparent'), #transparent legend bg
+    legend.box.background = element_rect(fill='transparent') #transparent legend panel
+  ) +
+  labs(x='Latitude', y='Longitude', title="Occurrence data of M. quinquenervia")
+
+ggsave(occ_plot, file="Figures/MR_occ.jpg")
+```
+
+#### Plotting results
+
+```{r}
+plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(ped_mquin, add = TRUE); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T); points(Mquin_locs_reclean_locations, cex=0.5, pch=16, col = "olivedrab"); legend("bottomright", legend = c("All points"), fill = c("olivedrab"))
+
+#b) Project with training occurrences, what is the probability of those?
+ped2 <- predict(mod_mquin_2, presence)
+boxplot(ped2)
+```
+
+# Getting the overlay between the two
+1. Reduce to the same extent
+```{r}
+extent_intersection <- terra::intersect(extent(ped_mquin), extent(ped1))
+
+my_map <- crop(x = world_map, y = extent_intersection) # Crop the map to our area of interest
+ped1_crop <- raster::crop(x = ped1, extent_intersection) # Crop the map to our area of interest
+ped_mquin_crop <- raster::crop(x = ped_mquin, extent_intersection) # Crop the map to our area of interest
+```
+
+2. Calculate overlay
+```{r}
+rsum = sum(ped1_crop,ped_mquin_crop,na.rm=TRUE)
+```
+
+If we want min to be 0 here's the script to rescale so the plot is sexier
+```{r}
+min_value_MQ <- min(values(ped_mquin_crop)[!is.na(values(ped_mquin_crop))]); ped_mquin_crop_rescaled <- ped_mquin_crop - min_value_MQ
+min_value_MR <- min(values(ped1_crop)[!is.na(values(ped1_crop))]); ped_MR_crop_rescaled <- ped1_crop - min_value_MR
+rsum_min0m = sum(ped_MR_crop_rescaled,ped_mquin_crop_rescaled,na.rm=FALSE)
+```
+
+3. Plotting results
+```{r}
+## Plotted MR
+pal_mr <- colorRampPalette(c("grey95","darkblue","red"))
+MR_ped_plot <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(ped1, add = TRUE, col = pal_mr(20)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T)
+
+## Plotted Mquin
+pal_mq <- colorRampPalette(c("grey95","orange","forestgreen"))
+Mquin_ped_plot <- plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(ped_mquin, add = TRUE, col = pal_mq(20)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T)
+
+## Plotted intersection
+pal_int <- colorRampPalette(c("grey95","yellow","red", "brown"))
+plot(my_map, axes = TRUE, col = "grey95", border="white"); plot(rsum, add = TRUE, col = pal_int(20)); plot(my_map, axes = TRUE, alpha=0, col=NA, add=T)
+```
+
+##########################################################################################
+
+# Saving res for interaction plots
+```{r}
+writeRaster(rsum_min0m, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_intersection.tiff", overwrite=TRUE)
+writeRaster(ped_mquin_crop, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_MQuin.tiff", overwrite=TRUE)
+writeRaster(ped1_crop, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_MR.tiff", overwrite=TRUE)
+writeVector(my_map, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_studyarea.gpkg", overwrite=TRUE)
+write.csv(Mquin_locs_reclean_locations, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/Shiny/MR_MQ_SDM/data/MQ_locs_clean.csv")
+write.csv(MR_locs_AUS_thin_locations, "C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/Shiny/MR_MQ_SDM/data/MR_locs_clean.csv")
+```
+
+# Future predictions - looped by year cluster and by scenario 
+Let's use the Maxent model for the sake of brain
+
+```{r eval=FALSE}
+years_clust <- c("2021-2040", "2041-2060", "2061-2080")
+ssp_list <- c("126", "245", "370", "585")
+
+for (cluster in years_clust){
+  for (ssp in ssp_list){
+    cmip6_world(model = "MPI-ESM1-2-HR", ssp = ssp, time = cluster, var = "bioc", res = 2.5, path = "data/bioclim")
+  }
+}
+```
+
+
+```{r}
+years_clust <- c("2021-2040", "2041-2060", "2061-2080")
+ssp_list <- c("126", "245", "370", "585")
+
+### MR
+
+par(mfrow=c(3,4))
+# loopity in a loopity
+
+for (cluster in years_clust) {
+  for (ssp in ssp_list) {
+
+    print(paste("Running:", cluster, ssp))
+    # Defining outputs
+    future_clim <- rast(paste0('data/bioclim/wc2.1_2.5m/wc2.1_2.5m_bioc_MPI-ESM1-2-HR_ssp', ssp,'_', cluster, '.tif'))
+    names(future_clim) <- list('wc2.1_2.5m_bio_1', 'wc2.1_2.5m_bio_2', 'wc2.1_2.5m_bio_3', 'wc2.1_2.5m_bio_4', 'wc2.1_2.5m_bio_5', 'wc2.1_2.5m_bio_6', 'wc2.1_2.5m_bio_7', 'wc2.1_2.5m_bio_8', 'wc2.1_2.5m_bio_9', 'wc2.1_2.5m_bio_10', 'wc2.1_2.5m_bio_11', 'wc2.1_2.5m_bio_12', 'wc2.1_2.5m_bio_13', 'wc2.1_2.5m_bio_14', 'wc2.1_2.5m_bio_15', 'wc2.1_2.5m_bio_16', 'wc2.1_2.5m_bio_17', 'wc2.1_2.5m_bio_18', 'wc2.1_2.5m_bio_19')
+    future_data_rast_crop <- crop(future_clim, studyArea@extent) # We crop both the future clim to our studyarea extent
+    # Pred
+    future_presence_MR_Maxent <- predict(future_data_rast_crop, mod3, type = "response", na.rm = TRUE) # Using MR Maxent model
+
+    # Plot
+    MR_ped_plot_future_Maxent <- plot(my_map, axes = TRUE, col = "grey95", border = "white"); plot(future_presence_MR_Maxent, add = TRUE, col = pal_mr(20), range = c(0, 0.7), legend=FALSE); plot(my_map, axes = TRUE, alpha = 0, col = NA, add = TRUE, main = paste0("Future MR Maxent\n", cluster,' & ssp', ssp), xlab = "Latitude", ylab = "Longitude", cex.main = 0.7)
+    
+    # Assigning it to individual plots
+    assign(paste0("MR_ped_plot_future_Maxent_", cluster, "_", ssp), future_presence_MR_Maxent)
+    print(paste("Finished:", cluster, ssp))
+    }
+}
+
+### Mquin
+
+par(mfrow=c(3,4))
+# loopity in a loopity
+
+for (cluster in years_clust) {
+  for (ssp in ssp_list) {
+    print(paste("Running:", cluster, ssp))
+
+    # Defining outputs
+    future_clim <- rast(paste0('data/bioclim/wc2.1_2.5m/wc2.1_2.5m_bioc_MPI-ESM1-2-HR_ssp', ssp,'_', cluster, '.tif'))
+    names(future_clim) <- list('wc2.1_2.5m_bio_1', 'wc2.1_2.5m_bio_2', 'wc2.1_2.5m_bio_3', 'wc2.1_2.5m_bio_4', 'wc2.1_2.5m_bio_5', 'wc2.1_2.5m_bio_6', 'wc2.1_2.5m_bio_7', 'wc2.1_2.5m_bio_8', 'wc2.1_2.5m_bio_9', 'wc2.1_2.5m_bio_10', 'wc2.1_2.5m_bio_11', 'wc2.1_2.5m_bio_12', 'wc2.1_2.5m_bio_13', 'wc2.1_2.5m_bio_14', 'wc2.1_2.5m_bio_15', 'wc2.1_2.5m_bio_16', 'wc2.1_2.5m_bio_17', 'wc2.1_2.5m_bio_18', 'wc2.1_2.5m_bio_19')
+    future_data_rast_crop <- crop(future_clim, extent_intersection) # We crop both the future clim to our studyarea extent
+
+    # Pred
+    future_presence_MQ_Maxent <- predict(future_data_rast_crop, mod_mquin_2, na.rm = TRUE) # Using MR Maxent model
+
+    # Plot
+    MQ_ped_plot_future_Maxent <- plot(my_map, axes = TRUE, col = "grey95", border = "white"); plot(future_presence_MQ_Maxent, add = TRUE, col = pal_mq(20), range = c(0, 0.7), legend=FALSE); plot(my_map, axes = TRUE, alpha = 0, col = NA, add = TRUE, main = paste0("Future MQ Maxent\n", cluster,' & ssp', ssp), xlab = "Latitude", ylab = "Longitude", cex.main = 0.7)
+
+    # Assigning it to individual plots
+    assign(paste0("MQ_ped_plot_future_Maxent_", cluster, "_", ssp), future_presence_MQ_Maxent)
+    print(paste("Finished:", cluster, ssp))
+  }
+}
+```
+
+
+# Getting the overlay between the two for future plots to plot
+```{r}
+# 1. Reduce to the same extent, 2. Calculate intersection, 3. Setting min = 0, 4. Saving rasters
+
+years_clust <- c("2021-2040", "2041-2060", "2061-2080")
+ssp_list <- c("126", "245", "370", "585")
+
+### MR
+
+par(mfrow=c(3,4))
+# loopity in a loopity
+
+for (cluster in years_clust) {
+  for (ssp in ssp_list) {
+    
+    # 1) Crop
+    future_plot_MR <- raster::crop(x = get(paste0("MR_ped_plot_future_Maxent_", cluster, "_", ssp)), y=extent_intersection) 
+    future_plot_MQ <- raster::crop(x = get(paste0("MQ_ped_plot_future_Maxent_", cluster, "_", ssp)), y=extent_intersection) 
+    
+    # 2) Intersect
+    rsum_future = sum(future_plot_MR,future_plot_MQ,na.rm=TRUE)
+    
+    # 3) Set min value
+    future_min_value_MQ <- min(values(future_plot_MQ)[!is.na(values(future_plot_MQ))]); ped_mquin_crop_rescaled <- future_plot_MQ - future_min_value_MQ
+    future_min_value_MR <- min(values(future_plot_MR)[!is.na(values(future_plot_MR))]); future_ped_MR_crop_rescaled <- future_plot_MR - future_min_value_MR
+    future_rsum_min0m = sum(future_ped_MR_crop_rescaled,ped_mquin_crop_rescaled,na.rm=FALSE)
+  
+    # 4) Save
+    future_rsum_min0m_fp <- paste0("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/future_maxent_intersection", cluster, "_", ssp,".tiff")
+    future_min_value_MQ_fp <- paste0("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_MQuin", cluster, "_", ssp,".tiff")
+    future_min_value_MR_fp <- paste0("C:/Users/swirl/OneDrive/Documents/Uni/Doctorate/SDM/output/maxent_outputs/plots/maxent_MR", cluster, "_", ssp,".tiff")
+    
+    writeRaster(future_rsum_min0m, future_rsum_min0m_fp, overwrite=TRUE)
+    writeRaster(future_plot_MR, future_min_value_MQ_fp, overwrite=TRUE)
+    writeRaster(future_plot_MQ, future_min_value_MR_fp, overwrite=TRUE)
+  }
+}
+
+```
