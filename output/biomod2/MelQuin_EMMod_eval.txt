@@ -1,0 +1,2 @@
+"full.name" "merged.by.PA" "merged.by.run" "merged.by.algo" "filtered.by" "algo" "metric.eval" "cutoff" "sensitivity" "specificity" "calibration" "validation" "evaluation"
+"MelQuin_EMmeanByTSS_mergedData_mergedRun_mergedAlgo" "mergedData" "mergedRun" "mergedAlgo" "TSS" "EMmean" "TSS" 453 94.737 94.359 0.891 NA NA
