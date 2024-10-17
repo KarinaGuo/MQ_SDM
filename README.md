@@ -15,4 +15,7 @@ Conservation is expensive. To maximise resources, efforts in restoration are lea
 └── /output/. *; Maxent and biomod diagnostic outputs from respective .Rmd*  
 └── /Shiny/MR_MQ_SDM/. *; Data and scripts to create shiny application. Input information is generated from SDM_Maxent.Rmd*  
 &nbsp;&nbsp;&nbsp;&nbsp;├── app.R *; Script used to create file*  
-&nbsp;&nbsp;&nbsp;&nbsp;└── data/. *; Input data files* 
+&nbsp;&nbsp;&nbsp;&nbsp;└── data/. *; Input data files*   
+
+**To run the shiny application**
+Save └── /Shiny/MR_MQ_SDM/. locally to your device and open app.R. Run from the top, ensuring file paths are correct.
